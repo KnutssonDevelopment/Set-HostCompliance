@@ -1,0 +1,401 @@
+#requires -modules VMware.VimAutomation.Core
+
+Function Set-HostCompliance {
+    <#
+    .SYNOPSIS
+        This function will aid in setting host compliance options.
+    
+    .DESCRIPTION
+        You can use this function either to scan or fix these issues. If run with the scan
+        option no changes will be made, only reporting of problems with be written to the sceen
+    
+    .PARAMETER VMHosts
+        You need to provide the function with an array of ESXi hosts to either scan or fix.
+        You can prepare an array in the following way.
+    
+        EX:
+        $VMHosts = Get-VMHost
+        Set-HostCompliance -VMHosts $VMHosts -Action:SCAN
+        
+    .PARAMETER Action
+        You will need to select the acton taken with Hosts that are not compliant
+    
+        SCAN: 
+        - The SCAN action will only list the settings that are not compliant, but will not correct them.
+    
+        FIX:
+        - The FIX action will try to apply the correct settings to the host.
+    
+    .PARAMETER IncludeWitnessHosts
+        You can define if you want to include vSAN witness hosts. This is not included by default.
+    
+    .PARAMETER IncludePending
+        You can define if you want to include hosts pending configuration. This is not included by default, and will exclude hosts that are in a cluster with CONFIG in the name.
+    
+    .PARAMETER Verbose
+        If you want a lot of output from the script runtime you can enable this value for debugging.
+           
+    .EXAMPLE
+        C:\PS>
+        Set-HostCompliance -VMHosts <Array of ESXi Hosts> -Action:<SCAN or FIX> -IncludeWitnessHosts:<TRUE or FALSE>
+    
+    
+        # Command to Scan some hosts
+        Set-HostCompliance -VMHosts $VMHosts -Action:SCAN -IncludeWitnessHosts:$true -IncludePending:$false
+    
+        # Command to Fix compliance issues on some hosts
+        Set-HostCompliance -VMHosts $VMHosts -Action:FIX -IncludeWitnessHosts:$true -IncludePending:$false
+    
+        
+    .NOTES
+        Author: Brian F. Knutsson - CRIT Solutions
+        Date Created: March 15, 2022
+        Version: 1.0
+    
+    #>
+        param(  [Parameter(Mandatory=$true)][System.Array]$VMHosts,
+                [Parameter(Mandatory=$true)][ValidateSet("SCAN","FIX")][String]$Action,
+                [boolean]$IncludeWitnessHosts=$false,
+                [boolean]$IncludePending=$false
+        )
+    
+    
+        Function Check-VMHostAdvancedSettingValue {
+            param([VMware.VimAutomation.ViCore.Impl.V1.Inventory.VMHostImpl]$VMHost,
+                [string]$Setting,
+                [string]$Value,
+                [boolean]$Enforce
+            )
+    
+    
+            #Severities
+            $Info = 1
+            $Warning = 2
+            $Critical= 3
+    
+            $hostSetting = Get-AdvancedSetting -Entity $VMHost -Name $Setting
+            $messages = @()
+    
+            if ($hostSetting.Value -ne $Value) {
+                if ($Enforce) {
+                    $messages += New-Message -Message "Changing: $VMHost - Setting: " -MessageColor "White" -NewLine $false -Severity $Warning
+                    $messages += New-Message -Message "$($Setting): $($($hostSetting).Value) " -MessageColor "Yellow" -NewLine $false -Severity $Warning
+                    $messages += New-Message -Message "to $Value" -MessageColor "White" -NewLine $true -Severity $Warning
+                    Get-AdvancedSetting -Entity $VMHost -Name $Setting | Set-AdvancedSetting -Value $Value -Confirm:$false | Out-Null
+                    return $true, $messages
+                } else {
+                    $messages += New-Message -Message "$VMHost - Setting: " -MessageColor "White" -NewLine $false -Severity $Warning
+                    $messages += New-Message -Message "$($Setting) is set to $($($hostSetting).Value)" -MessageColor "Yellow" -NewLine $true -Severity $Warning
+                    return $false, $messages
+                }
+            } else {
+                $messages += New-Message -Message "$VMHost - Setting: $($Setting) Value: " -MessageColor "White" -NewLine $false -Severity $Info
+                $messages += New-Message -Message "OK" -MessageColor "Green" -NewLine $true -Severity $Info
+                return $true, $messages
+            }
+        }
+    
+        Function New-Message {
+            param([string]$Message,
+                  [string]$MessageColor,
+                  [boolean]$NewLine,
+                  [int]$Severity)
+    
+            $msgObject = New-Object -TypeName psobject
+            $msgObject | Add-Member -MemberType NoteProperty -Name "Message" -Value $Message
+            $msgObject | Add-Member -MemberType NoteProperty -Name "MessageColor" -Value $MessageColor
+            $msgObject | Add-Member -MemberType NoteProperty -Name "NewLine" -Value $NewLine
+            $msgObject | Add-Member -MemberType NoteProperty -Name "Severity" -Value $Severity
+    
+            return $msgObject
+        }
+    
+        $hostStatus = @()
+        if ($PSCmdlet.MyInvocation.BoundParameters["Verbose"].IsPresent) { $verbose = $true } else { $verbose = $false }
+    
+        if ($Action -match "SCAN") {
+            #Write-Host "Script Options set to SCAN Only"
+            $EnforceValues = $false
+        } elseif ($Action -match "FIX") {
+            #Write-Host "Script Options set to FIX errors"
+            $EnforceValues = $true
+        }
+    
+        if ($IncludeWitnessHosts) {
+            $vmhosts = $vmhosts | Where-Object { ($_.ConnectionState -eq "Connected" -Or $_.ConnectionState -eq "Maintenance") } 
+        } else {
+            $vmhosts = $vmhosts | Where-Object { ($_.ConnectionState -eq "Connected" -Or $_.ConnectionState -eq "Maintenance") -And $_.Model -ne "VMware Virtual Platform"}
+        }
+    
+        $ShellTimeout = "1800"
+        $ShellItractTimeout = "7200"
+        $AccountUnlockTime = "900"
+        $AccountLockFailures = "5"
+        $PassordQualityControl = "retry=3 min=disabled,disabled,disabled,18,18"
+        $AcceptanceLevel = "PartnerSupported"
+        $TPS = 2
+    
+        #Severities
+        $Info = 1
+        $Warning = 2
+        $Critical= 3
+    
+    
+        Write-Host "This Script will set the Ørsted Default Security Settings for hosts in a vCenter"
+        Write-Host ""
+    
+        Write-Host "SCRIPT RUNTIME SETTINGS:"
+        Write-Host "--------------------------------------------------------------"
+        Write-Host "Action:`t`t`t`t`t`t`t`t`t" -NoNewline
+        Write-Host $Action -ForegroundColor Green
+        Write-Host "IncludeWitnessHosts:`t`t`t`t`t" -NoNewline
+        Write-Host $IncludeWitnessHosts -ForegroundColor Green
+        Write-Host "IncludePending:`t`t`t`t`t`t`t" -NoNewline
+        Write-Host $IncludePending -ForegroundColor Green
+        Write-Host "Verbose:`t`t`t`t`t`t`t`t" -NoNewline
+        Write-Host $Verbose -ForegroundColor Green
+        Write-Host ""
+    
+    
+        Write-Host "HOST SETTINGS CHECKED:"
+        Write-Host "--------------------------------------------------------------"
+        Write-Host "UserVars.ESXiShellTimeOut:`t`t`t`t" -NoNewline
+        Write-Host $ShellTimeout -ForegroundColor Green
+        Write-Host "UserVars.ESXiShellInteractiveTimeOut:`t" -NoNewline
+        Write-Host $ShellItractTimeout -ForegroundColor Green
+        Write-Host "Security.AccountUnlockTime:`t`t`t`t" -NoNewline
+        Write-Host $AccountUnlockTime -ForegroundColor Green
+        Write-Host "Security.AccountLockFailures:`t`t`t" -NoNewline
+        Write-Host $AccountLockFailures -ForegroundColor Green
+        Write-Host "Security.PasswordQualityControl:`t`t" -NoNewline
+        Write-Host $PassordQualityControl -ForegroundColor Green
+    
+        Write-Host "Software Acceptance Level:`t`t`t`t" -NoNewline
+        Write-Host $AcceptanceLevel -ForegroundColor Green
+        Write-Host "Mem.ShareForceSalting:`t`t`t`t`t" -NoNewline
+        Write-Host $TPS -ForegroundColor Green
+        
+        Write-Host "SSH Service Status:`t`t`t`t`t`t" -NoNewline
+        Write-Host "OFF" -ForegroundColor Green
+        Write-Host "SSH Service Startup Policy:`t`t`t`t" -NoNewline
+        Write-Host "OFF" -ForegroundColor Green
+        Write-Host "NTP Service Status:`t`t`t`t`t`t" -NoNewline
+        Write-Host "ON" -ForegroundColor Green
+        Write-Host "NTP Service Configured:`t`t`t`t`t" -NoNewline
+        Write-Host $true -ForegroundColor Green
+        Write-Host "NTP Service Startup Policy:`t`t`t`t" -NoNewline
+        Write-Host "ON" -ForegroundColor Green
+        Write-Host ""
+        Write-Host ""
+    
+        Write-Host "HOST PROGRESS:"
+        Write-Host "--------------------------------------------------------------"
+        
+    
+        $last_output = $true
+    
+        foreach ($vmhost in $vmhosts) {
+            try {
+                $clusterName = ($vmhost | Get-Cluster).Name
+            }
+    
+            catch {
+                $clusterName = ""            
+            }
+    
+            if (($clusterName -Like "*config*") -and (!$IncludePending)) {
+                #$vmhost
+                continue
+            }
+    
+            $messages = @()
+            $status = @()
+    
+            $r = Check-VMHostAdvancedSettingValue -VMHost $VMHost -Setting "UserVars.ESXiShellTimeOut" -Value $ShellTimeout -Enforce:$EnforceValues 
+            $status += $r[0]
+            $messages += $r[1]
+    
+            $r = Check-VMHostAdvancedSettingValue -VMHost $VMHost -Setting "UserVars.ESXiShellInteractiveTimeOut" -Value $ShellItractTimeout -Enforce:$EnforceValues
+            $status += $r[0]
+            $messages += $r[1]
+    
+            $r = Check-VMHostAdvancedSettingValue -VMHost $VMHost -Setting "Security.AccountUnlockTime" -Value $AccountUnlockTime -Enforce:$EnforceValues
+            $status += $r[0]
+            $messages += $r[1]
+    
+            $r = Check-VMHostAdvancedSettingValue -VMHost $VMHost -Setting "Security.AccountLockFailures" -Value $AccountLockFailures -Enforce:$EnforceValues
+            $status += $r[0]
+            $messages += $r[1]
+    
+            $r = Check-VMHostAdvancedSettingValue -VMHost $VMHost -Setting "Security.PasswordQualityControl" -Value $PassordQualityControl -Enforce:$EnforceValues
+            $status += $r[0]
+            $messages += $r[1]
+    
+            $r = Check-VMHostAdvancedSettingValue -VMHost $VMHost -Setting "Mem.ShareForceSalting" -Value $TPS -Enforce:$EnforceValues
+            $status += $r[0]
+            $messages += $r[1]
+    
+            $sshService = $vmhost | Get-VMHostService | Where-Object { $_.Key -eq "TSM-SSH" }
+            if ($sshService.Policy -ne "off") {
+                if ($EnforceValues) {
+                    $messages += New-Message -Message "Changing: $VMHost - SSH Startup Policy" -MessageColor "White" -NewLine $false -Severity $Warning
+                    $messages += New-Message -Message "$($($sshService).Policy) " -MessageColor "Yellow" -NewLine $false -Severity $Warning
+                    $messages += New-Message -Message " to Off" -MessageColor "White" -NewLine $true -Severity $Warning
+    
+                    $sshService | Set-VMHostService -Policy Off | Out-Null
+                } else {
+                    $messages += = New-Message -Message "$VMHost - SSH Startup Policy: $($($sshService).Policy)" -MessageColor "Yellow" -NewLine $true -Severity $Warning
+                }
+            } elseif ($Verbose) {
+                $messages += New-Message -Message "$VMHost - SSH Startup Policy is " -MessageColor "White" -NewLine $false -Severity $Info
+                $messages += New-Message -Message "OFF" -MessageColor "Green" -NewLine $true -Severity $Info
+            }
+    
+            if ($sshService.Running) {
+                if ($EnforceValues) {
+                    $messages += New-Message -Message "$vmhost - Stopping SSH Service" -MessageColor "Green" -NewLine $true -Severity $Warning
+                    $sshService | Stop-VMHostService -Confirm:$false | Out-Null
+                } else {
+                    $messages += New-Message -Message "$vmhost - SSH Running: $($($sshService).running)" -MessageColor "Yellow" -NewLine $true -Severity $Warning
+                }
+            }
+    
+            $ntpService = $vmhost | Get-VMHostService | Where-Object { $_.Key -eq "ntpd" }
+            if ($ntpService.Policy -ne "on") {
+                if ($EnforceValues) {
+                    try {
+                        $ntpServers = ($vmhost | Get-VMHostNtpServer -ErrorAction:Stop).Split()
+                    }
+                    catch {
+                        $ntpServers = ""
+                    }
+    
+                    if ($ntpServers) {
+                        $messages += New-Message -Message "Changing: $VMHost - NTP Startup Policy " -MessageColor "White" -NewLine $false -Severity $Warning
+                        $messages += New-Message -Message "$($ntpService.Policy)" -MessageColor "Yellow" -NewLine $false -Severity $Warning
+                        $messages += New-Message -Message " to ON" -MessageColor "White" -NewLine $true -Severity $Warning          
+                        $ntpService | Set-VMHostService -Policy On | Out-Null
+                    } else {
+                        $messages += New-Message -Message "$VMHost - No NTP Servers defined!" -MessageColor "Yellow" -NewLine $true -Severity $Warning
+                    }
+                } else {
+                    $messages += New-Message -Message "$VMHost - NTP Startup Policy: $($ntpService.Policy)" -MessageColor "Yellow" -NewLine $true -Severity $Warning
+                }
+            } elseif ($Verbose) {
+                $messages += New-Message -Message "$VMHost - NTP Startup Policy is " -MessageColor "White" -NewLine $false -Severity $Info
+                $messages += New-Message -Message "ON" -MessageColor "Green" -NewLine $true -Severity $Info
+            }
+
+            $ESXCli = Get-EsxCli -VMHost $vmhost 
+            $Value = $ESXCli.software.acceptance.Get()
+            if ($Value -ne $AcceptanceLevel) {
+                if ($EnforceValues) {
+                    $packages = $ESXCli.software.vib.list() | Where-Object { -Not (($_.AcceptanceLevel -eq "VMwareCertified") -or ($_.AcceptanceLevel -eq "PartnerSupported") -or ($_.AcceptanceLevel -eq "VMwareAccepted")) }
+                    if ($packages.count -eq 0) {
+                        $messages += New-Message -Message "Changing: $VMHost - Setting: " -MessageColor "White" -NewLine $false -Severity $Warning
+                        $messages += New-Message -Message "AcceptanceLevel: $($Value) " -MessageColor "Yellow" -NewLine $false -Severity $Warning
+                        $messages += New-Message -Message "to $AcceptanceLevel" -MessageColor "White" -NewLine $true -Severity $Warning
+                        $ESXCli.software.acceptance.Set($AcceptanceLevel) | Out-Null
+                        $status += $true
+                    } else {
+                        if ($packages | Where-Object { $_.Name -eq "smartctl" }) {
+                            $messages += New-Message -Message "Uninstalled: $VMHost - VIB: " -MessageColor "White" -NewLine $false -Severity $Warning
+                            $messages += New-Message -Message "smartctl" -MessageColor "Yellow" -NewLine $true -Severity $Warning
+    
+                            $ESXCli.software.vib.remove($false,$false,$false,$false, "smartctl")
+                            $packages = $ESXCli.software.vib.list() | Where-Object { -Not (($_.AcceptanceLevel -eq "VMwareCertified") -or ($_.AcceptanceLevel -eq "PartnerSupported") -or ($_.AcceptanceLevel -eq "VMwareAccepted")) }
+                            if ($packages.count -eq 0) {
+                                $messages += New-Message -Message "Changing: $VMHost - Setting: " -MessageColor "White" -NewLine $false -Severity $Warning
+                                $messages += New-Message -Message "AcceptanceLevel: $($Value) " -MessageColor "Yellow" -NewLine $false -Severity $Warning
+                                $messages += New-Message -Message "to $AcceptanceLevel" -MessageColor "White" -NewLine $true -Severity $Warning
+                                $ESXCli.software.acceptance.Set($AcceptanceLevel) | Out-Null
+                                $status += $true
+                            } else {
+                                $messages += New-Message -Message "$vmhost - Could not set AcceptanceLevel" -MessageColor "Red" -NewLine $false -Severity $Warning
+                                $messages += New-Message -Message "- The following packages are not suppoted:" -MessageColor "Yellow" -NewLine $false -Severity $Warning
+                                $messages += New-Message -Message "$packages" -MessageColor "Red" -NewLine $true -Severity $Warning
+                                $status += $false
+                            }
+                        } else {
+                            $messages += New-Message -Message "$vmhost - Could not set AcceptanceLevel" -MessageColor "Red" -NewLine $false -Severity $Warning
+                            $messages += New-Message -Message "- The following packages are not suppoted:" -MessageColor "Yellow" -NewLine $false -Severity $Warning
+                            $messages += New-Message -Message "$packages" -MessageColor "Red" -NewLine $true -Severity $Warning
+                            $packages | ft -AutoSize
+                        }
+                    }
+                } else {
+                    $messages += New-Message -Message "$VMHost - Setting: AcceptanceLevel Value: " -MessageColor "White" -NewLine $false -Severity $Warning
+                    $messages += New-Message -Message "$($Value)" -MessageColor "Yellow" -NewLine $true -Severity $Warning
+                    $status += $false
+                }
+            } elseif ($Verbose) {
+                $messages += New-Message -Message "$VMHost - Setting: AcceptanceLevel Value: " -MessageColor "White" -NewLine $false -Severity $Info
+                $messages += New-Message -Message "OK" -MessageColor "Green" -NewLine $true -Severity $Info
+            }
+            #Start-Sleep -s 5
+    
+            $object = New-Object -TypeName psobject
+            $object | Add-Member -MemberType NoteProperty -Name "VMHost" -Value $vmhost
+            $object | Add-Member -MemberType NoteProperty -Name "Compliant" -Value (-not($status.Contains($false)))
+    
+            $hostStatus += $object
+    
+            $output = $false
+            foreach ($message in $messages) {
+                #Write-Host "$message.Message, $message.MessageColor"
+                if ($Verbose -Or $message.Severity -ge $Warning) {
+                    if ($message.NewLine) {
+                        if (!$last_output) {
+                            Write-Host ""
+                            $last_output = $true
+                        }
+                        Write-Host "$($message.Message)" -ForegroundColor $message.MessageColor
+                        $output = $true
+                    } else {
+                        if (!$last_output) {
+                            Write-Host ""
+                            $last_output = $true
+                        }
+                        Write-Host "$($message.Message)" -ForegroundColor $message.MessageColor -NoNewline
+                        $output = $true
+                    }
+                }
+            }
+    
+            if ($output) {
+                Write-Host "--------------------------------------------------------------"
+            } else {
+                Write-Host "." -NoNewline
+                $last_output = $false
+            }
+        }
+        $goodCount = ($hostStatus | Where-Object { $_.Compliant -Like $true } | Measure-Object).Count
+        $badCount = ($hostStatus | Where-Object { $_.Compliant -Like $false } | Measure-Object).Count
+        Write-Host ""
+        Write-Host ""
+        Write-Host "HOST Results:"
+        Write-Host "--------------------------------------------------------------"
+    
+        Write-Host "Compliant Hosts: $($goodCount)"
+        Write-Host "NonCompliant Hosts: $($badCount)"
+    }
+    
+    
+    <#
+    
+    $cluster = Get-Cluster <ClusterName>
+    $cluster
+    
+    $VMHosts = $cluster | Get-VMHost | Sort-Object
+    $VMHosts = Get-VMHost | Sort-Object
+    $VMHosts 
+    
+    Set-HostCompliance -VMHosts $VMHosts -Action:SCAN -IncludeWitnessHosts:$true -IncludePending:$true
+    Set-HostCompliance -VMHosts $VMHosts -Action:FIX -IncludeWitnessHosts:$true -IncludePending:$true
+    
+    #>
+    
+    
+    
+    
+    
